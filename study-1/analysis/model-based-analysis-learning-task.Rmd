@@ -1,0 +1,1332 @@
+---
+title: "modComp study: model-based analysis of learning task data"
+output:
+  html_document:
+    html-math-method:
+      method: mathjax
+  #  pdf_document:
+  # extra_dependencies: ["bbm"]
+  # fig_caption: yes
+---
+
+```{r setup, include=FALSE}
+# knitr options
+knitr::opts_chunk$set(echo=FALSE, error=TRUE, warning=FALSE, message=FALSE, fig.align='center')
+
+# load packages
+packages <- c("rstan", "dplyr", "tidyr", "bayesplot", "loo", "Rlab", "boot", "hBayesDM",
+              "tidybayes", "forcats", "unikn","multicon", "ggpmisc", "patchwork", "devtools",
+              "lme4", "lmerTest", "rstatix", "boot", "reshape2", "ggExtra", "ggcorrplot")
+if (length(setdiff(packages, rownames(installed.packages()))) > 0 ) {
+  install.packages(setdiff(packages, rownames(installed.packages())))
+}
+lapply(packages, require, character.only=TRUE)
+
+# load rainCloudPlot src code
+source_url("https://raw.githubusercontent.com/RainCloudPlots/RainCloudPlots/master/tutorial_R/R_rainclouds.R")
+
+# set wd
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+# what task version 
+task_ver <- "causal-attr-1-2"
+```
+
+```{r setup_rstan}
+rstan_options(auto_write = TRUE)   # write the models so we don't have to recompile each time
+nCores <- parallel::detectCores()    # get number of cores available for parallelisation
+```
+
+```{r setup_colour_scales}
+# lets set some custom colour scales for our plots using unikn
+#seecol(pal_unikn_pair)
+palette2 <- usecol(pal_unikn_pair) 
+colours3 <- c("restructuring" = palette2[2],
+              "control" = palette2[3]               # restructuring  intervention control
+              )
+# colours by model parameter type
+colours2 <- c("group mean" = palette2[14],
+              "intervention effect" = palette2[2],  # active intervention of interest here = psychoed
+              "learning" = palette2[9]
+              )
+```
+
+```{r load_data}
+# load long format data for learning task from initial discovery and replication samples
+data_long_all <- read.csv(file=paste0("./", task_ver, "-learning-task-data-anon.csv")) %>%
+  dplyr::select(-X)
+
+## get number of time points etc
+nPpts <- length(unique(data_long_all$uid))
+nTrials_all <- data_long_all %>%
+  arrange(uid) %>%
+  group_by(uid) %>%
+  summarize(nTrials = n()) %>%
+  mutate(ID = seq(1, nPpts, 1))          # assign sequential numeric uids for ease / anonymity
+data_long_all <- merge(data_long_all, nTrials_all, by="uid")
+
+nTrials_max <- nTrials_all %>%
+  {max(.$nTrials)}
+
+# get lists of subjects IDs by condition for use with other data
+control_subs <- data_long_all %>%
+  filter(condition=="control") %>%
+  dplyr::select(uid, ID)
+controls <- as.list(unique(control_subs$uid))
+control_IDs <- as.list(unique(control_subs$ID))
+
+# get ordered list of intervention conditions
+int_conds <- data_long_all %>%
+  arrange(ID) %>%
+  group_by(ID) %>%
+  dplyr::select(ID, condition) %>%
+  distinct() %>%
+  mutate(condition01 = ifelse(condition=="psychoed", 1, 0))
+```
+
+Quick plot of the data we'll be modelling:
+
+```{r tot_choice}
+p <- data_long_all %>%
+  dplyr::select(uid, valence, internalGlobalChosen, 
+         internalSpecificChosen, externalGlobalChosen, externalSpecificChosen) %>%
+  group_by(uid, valence) %>%
+  mutate(trialNoByVal = 1:n()) %>%
+  melt(id.vars=c("uid", "valence", "trialNoByVal")) %>%
+  ggplot(aes(x=trialNoByVal, y=value, group=variable, colour=variable, fill=variable)) +
+  stat_summary(fun=mean, geom="line") +
+  stat_summary(fun.data=mean_se, geom="ribbon", alpha=.2, 
+                   colour = NA) +
+  ylab("proportionate choice of each attribution type") +
+  xlab("trial") + facet_wrap(~valence) +
+  theme_minimal() + theme(legend.position="top") + ylim(0,1) +
+  geom_hline(yintercept = c(0.5), linetype = "dotted") +
+  geom_vline(xintercept = c(10.5,20.5), linetype = "dashed") +
+  scale_fill_brewer(palette="Set2") + scale_colour_brewer(palette="Set2")
+p
+# ggsave(filename = paste0("./figures/", task_ver, "-learning-behaviour.svg"),
+#        plot = last_plot(), device = "svg", dpi = 300)
+```
+
+Run some stats on choice accuracy behaviour
+
+```{r behav_lm}
+# add new variable of trial within block since we 'reset' each scenario (block)
+data_long_all2 <- data_long_all %>%
+  group_by(uid, blockNo) %>%
+  mutate(trialWithinBlock = 1:n())
+
+# lme analysis
+lm <- lmer(correct ~ trialWithinBlock * valence * blockNo + (1 | uid),
+           data = data_long_all2)
+summary(lm)
+anova(lm)
+```
+
+And look at choice reaction times (RTs)
+
+```{r tot_rt}
+p <- data_long_all %>%
+  filter(timedout==FALSE) %>%
+  dplyr::select(uid, valence, trialNo, rt) %>%
+  group_by(uid, valence) %>%
+  mutate(trialNoByVal = 1:n()) %>%
+  ggplot(aes(x=trialNoByVal, y=rt, group=valence, colour=valence, fill=valence)) +
+  stat_summary(fun=mean, geom="line") +
+  stat_summary(fun.data=mean_se, geom="ribbon", alpha=.2, 
+                   colour = NA) +
+  ylab("mean RT") +
+  xlab("trial") + 
+  theme_minimal() + theme(legend.position="top") +
+  geom_vline(xintercept = c(10,20), linetype = "dashed") +
+  scale_fill_brewer(palette="Set2") + scale_colour_brewer(palette="Set2")
+p
+
+p <- data_long_all %>%
+  filter(timedout==FALSE) %>%
+  dplyr::select(uid, valence, condition, trialNo, rt) %>%
+  group_by(uid, valence) %>%
+  mutate(trialNoByVal = 1:n()) %>%
+  ggplot(aes(x=trialNoByVal, y=rt, group=valence, colour=valence, fill=valence)) +
+  stat_summary(fun=median, geom="line") +
+  stat_summary(fun.data=median_hilow, geom="ribbon", alpha=.2, 
+                   colour = NA) +
+  ylab("median RT") +
+  xlab("trial") + 
+  theme_minimal() + theme(legend.position="top") + 
+  geom_vline(xintercept = c(10,20), linetype = "dashed") +
+  scale_fill_brewer(palette="Set2") + scale_colour_brewer(palette="Set2")
+p
+```
+
+```{r rt_lm}
+lm <- lmer(rt ~ trialWithinBlock * valence * blockNo + (1 | uid),
+           data = data_long_all2)
+summary(lm)
+anova(lm)
+```
+
+
+### Q-learning models
+
+Fit a series of Q-learning models to learning task data and inspect output
+
+```{r rstan_fit_2opt}
+## define model and data to fit:
+# 1. model with single learning rate across valences
+# model <- "m_qlearning_negpos_1alpha"
+
+# 2. base model (2 individual-level learning rates + softmax beta; q0 (starting value) each block=0.5)
+# model <- "m_qlearning_negpos_2alpha"
+
+# 3. base model + group-level free parameters governing q0 for internal-global (IG) attributions for pos, neg events:
+# model <- "m_qlearning_negpos_2alpha_2q0"               # across all blocks
+# model <- "m_qlearning_negpos_2alpha_2q0_init_delta"    # first block only, then +group-level delta
+# model <- "m_qlearning_negpos_2alpha_2q0_init_2delta"   # first block only, then +group-level delta
+
+# 4. base model + individual free parameters governing q0 for IG attributions for pos, neg events :
+# model <- "m_qlearning_negpos_2alpha_2q0i"              # across all blocks
+# model <- "m_qlearning_negpos_2alpha_2q0i_init2"        # first block only, then reset to 0.5
+# model <- "m_qlearning_negpos_2alpha_2q0i_init2_delta"  # first block only, then +group-level delta
+# model <- "m_qlearning_negpos_2alpha_2q0i_init2_2delta" # first block only, then +delta, 2*delta
+model <- "m_qlearning_negpos_2alpha_2q0i1_2q0i23"        # different q0i for blocks 1 vs 2,3
+
+## define data to fit
+data_to_fit <- "b123"
+
+## select data to model
+data_long_b123 <- data_long_all %>%
+  dplyr::select(uid, ID, trialNo, itemNo, blockNo, valence, chosen_attr_type, correct, rt) %>%
+  mutate(valence01 = ifelse(valence == "negative", 0, 
+                        ifelse(valence == "positive", 1, NA)),
+         choiceIG = ifelse(chosen_attr_type == "internal_global", 2, 1),
+         choiceIG01 = ifelse(chosen_attr_type == "internal_global", 1, 0)) %>%
+  group_by(uid) %>%
+  mutate(newTrialNo = 1:n()) %>%
+  ungroup()
+# for block1, int_spec = 1 int_glob = 2
+# for block2, ext_glob = 1 int_glob = 2 
+# for block3, ext_spec = 1 int_glob = 2 
+
+# create arrays of choice options and responses for each participant [and time point]
+blockNo <- valence <- choiceIG <- choiceIG01 <- outcome <- array(0, dim = c(nPpts, nTrials_max))
+nT_ppts <- array(nTrials_max, dim = c(nPpts))
+for (p in 1:nPpts) {
+  blockNo[p,]   <- with(eval(as.symbol(paste0("data_long_", data_to_fit))), blockNo[ID==p])
+  valence[p,]   <- with(eval(as.symbol(paste0("data_long_", data_to_fit))), valence01[ID==p])
+  choiceIG[p,]  <- with(eval(as.symbol(paste0("data_long_", data_to_fit))), choiceIG[ID==p])
+  choiceIG01[p,]<- with(eval(as.symbol(paste0("data_long_", data_to_fit))), choiceIG01[ID==p])
+  outcome[p,]   <- with(eval(as.symbol(paste0("data_long_", data_to_fit))), correct[ID==p])
+}
+
+# create data list to pass to stan
+data_list = list(
+  nPpts = nPpts,
+  nTrials_max = nTrials_max,     # max number of trials [per session] per participant
+  nT_ppts = nT_ppts,             # actual number of trials [per session] per participant
+  blockLength = nTrials_max/max(blockNo),
+  blockNo = blockNo,
+  valence = valence,
+  nChoices = 2,
+  choice = choiceIG,
+  outcome = outcome
+)
+
+# fit model using rstan
+fit <- stan(
+  file = paste0("./stan-models/", model, ".stan"),
+  data = data_list,
+  chains = 4,               # run 4 separate chains to assess convergence
+  warmup = 1000,            # these are used to tune the sampler and ’burn in’
+  iter = 2000,              # number of iterations (#kept = chains*(iter - warmup))
+  cores = nCores            # chains to be run in parallel on separate cores (if possible)
+)
+
+## save
+saveRDS(fit, file = paste0("./stan-fits/", model, "-", data_to_fit, "-", task_ver, "-fit.rds"))
+# ## OR load model from file
+# fit <- readRDS(file = paste0("./stan-fits/", model, "-", data_to_fit, "-", task_ver, "-fit.rds"))
+
+# check overall dx
+check_hmc_diagnostics(fit)
+
+# plot pairs of pars to examine non-identifiability:
+# pairs(fit, pars=c("alpha[1]",  "beta[1]"))
+pairs(fit, pars=c("alpha_neg[1]", "alpha_pos[1]", "beta[1]"))
+# pairs(fit, pars=c("alpha_neg[1]", "alpha_pos[1]", "q0_IG_neg", "q0_IG_pos", "beta[1]"))
+# pairs(fit, pars=c("alpha_neg[1]", "alpha_pos[1]", "q0_IG_neg", "q0_IG_pos", "delta_q0_IG_neg", "delta_q0_IG_pos", "beta[1]"))
+# pairs(fit, pars=c("alpha_neg[1]", "alpha_pos[1]", "q0_IG_neg[1]", "q0_IG_pos[1]", "beta[1]"))
+# pairs(fit, pars=c("alpha_neg[1]", "alpha_pos[1]", "beta[1]",
+#                   "q0_1_IG_neg[1]", "q0_1_IG_pos[1]", "q0_23_IG_neg[1]", "q0_23_IG_pos[1]"))
+# pairs(fit, pars=c("alpha_neg[1]", "alpha_pos[1]", "beta[1]", "q0_23_IG_pos[1]"))
+
+# plot group-level parameter samples
+pairs(fit, pars=c("mu_p", "sigma_p"))
+
+```
+
+Model comparison
+
+This is the model comparison procedure reported in (Vehtari, Gelman, & Gabry, 2017), which compares the expected log pointwise predictive density (ELPD) for each model. We determined the size of importance of ELPD difference by taking models greater than ~5 x the SE of the estimate.
+
+```{r mc}
+## comparison between models
+models_to_compare <- c("m_qlearning_negpos_1alpha",
+                       "m_qlearning_negpos_2alpha",
+                       "m_qlearning_negpos_2alpha_2q0",
+                       "m_qlearning_negpos_2alpha_2q0_init_delta",
+                       "m_qlearning_negpos_2alpha_2q0_init_2delta",
+                       "m_qlearning_negpos_2alpha_2q0i",
+                       "m_qlearning_negpos_2alpha_2q0i_init2",
+                       "m_qlearning_negpos_2alpha_2q0i_init2_delta",
+                       "m_qlearning_negpos_2alpha_2q0i_init2_2delta",
+                       "m_qlearning_negpos_2alpha_2q0i1_2q0i23"
+                       )
+# we can use the loo_compare function to compare our two models on expected log predictive density (ELPD) for new data
+data_to_fit <- "b123" 
+for (i in 1:length(models_to_compare)) {
+  fit <- readRDS(paste0("./stan-fits/",models_to_compare[i],"-",data_to_fit,
+                        "-",task_ver,"-fit.rds"))
+  assign(paste0("loo",as.character(i)), loo(fit, mc.cores = nCores)) 
+}
+loo_compare(loo1, loo2, loo3, loo4, loo5, loo6, loo7, loo8, loo9, loo10) 
+# in this output, the best model is defined as having zero difference to itself
+# see e.g., https://cran.r-project.org/web/packages/loo/vignettes/loo2-example.html
+```
+
+
+```{r plot_posteriors}
+## define model and data to fit
+model <- "m_qlearning_negpos_2alpha_2q0i1_2q0i23"
+data_to_fit <- "b123"
+fit <- readRDS(file = paste0("./stan-fits/", model, "-", data_to_fit, "-", task_ver, "-fit.rds"))
+
+# plot posterior densities for key parameters
+a <- plot(fit, pars = "alpha_neg", ci_level = 0.5, fill_color = "sky blue") +
+  ggtitle("posterior alpha_neg") +
+  theme(axis.text.y=element_blank(), plot.title=element_text(size = 12, face = "bold", hjust = 0.5)) +
+  xlim(0,1)
+  
+b <- plot(fit, pars = "alpha_pos", ci_level = 0.5, fill_color = "dark blue") +
+  ggtitle("posterior alpha_pos") +
+  theme(axis.text.y=element_blank(), plot.title=element_text(size = 12, face = "bold", hjust = 0.5)) +
+  xlim(0,1)
+
+c <- plot(fit, pars = "beta", ci_level = 0.5, fill_color = "sky blue") +
+  ggtitle("posterior beta") +
+  theme(axis.text.y=element_blank(), plot.title=element_text(size = 12, face = "bold", hjust = 0.5))
+(a + b + c)
+
+# scenario 1 starting values (q0s) for internal-global (IG) options (vs fixed alternative of 0.5)
+a <- plot(fit, pars = "q0_1_IG_neg", ci_level = 0.5, fill_color = "sky blue") +
+  ggtitle("posterior q0_1_IG_neg") +
+  theme(axis.text.y=element_blank(), plot.title=element_text(size = 12, face = "bold", hjust = 0.5)) +
+  xlim(0,1)
+
+b <- plot(fit, pars = "q0_1_IG_pos", ci_level = 0.5, fill_color = "dark blue") +
+  ggtitle("posterior q0_1_IG_pos") +
+  theme(axis.text.y=element_blank(), plot.title=element_text(size = 12, face = "bold", hjust = 0.5)) +
+  xlim(0,1)
+
+# scenario 2&3 starting values (q0s) for internal-global (IG) options (vs fixed alternative of 0.5)
+c <- plot(fit, pars = "q0_23_IG_neg", ci_level = 0.5, fill_color = "sky blue") +
+  ggtitle("posterior q0_23_IG_neg") +
+  theme(axis.text.y=element_blank(), plot.title=element_text(size = 12, face = "bold", hjust = 0.5)) +
+  xlim(0,1)
+
+d <- plot(fit, pars = "q0_23_IG_pos", ci_level = 0.5, fill_color = "dark blue") +
+  ggtitle("posterior q0_23_IG_pos") +
+  theme(axis.text.y=element_blank(), plot.title=element_text(size = 12, face = "bold", hjust = 0.5)) +
+  xlim(0,1)
+
+(a + b)
+(c + d)
+```
+
+```{r pred_acc}
+# original data
+y <- data_long_b123$choiceIG
+
+# extract replicate data generated using posterior parameter estimates
+y_rep <- as.data.frame(summary(fit, pars = c("y_rep"))$summary) %>%
+  filter(mean>=0) %>%   #remove padded values for trials ppts didn't actually complete
+  dplyr::select(`50%`) %>%
+  add_rownames(var = "var") %>%
+  separate(var, sep="\\[", into=c("variable", "tmp"), remove=TRUE, extra="drop") %>%
+  separate(tmp, sep=",", into=c("ID", "trial"), remove=TRUE, extra="drop") %>%
+  separate(trial, sep=-1, into="trial", extra="drop") %>%
+  mutate(ID=as.numeric(ID)) %>%
+  arrange(ID) %>%
+  rename(mean_predicted = `50%`)
+
+# predictive accuracy (per sub)
+y_rep <- cbind(y_rep, observed=y)
+accs <- y_rep %>%
+  group_by(ID) %>%
+  mutate(acc = (mean_predicted==observed)) %>%
+  summarise(mean_acc = mean(acc))
+
+# predictive accuracy (overall)
+summ <- accs %>%
+  summarise(mean_pred_acc=round(mean(mean_acc),2), sd_pred_acc=round(sd(mean_acc),2))
+print(summ)
+
+# sum log lik for each participant
+sum_log_liks <- rstan::extract(fit, pars = "log_lik")[[1]]
+mean_sum_log_liks <- colMeans(sum_log_liks) # average over samples
+
+# pseudo r2
+# pseudo-r2 can be calculated as 1 - L/C where L = sumloglik over participants and C = likelihood of observing by chance (nTrials*log(0.5))
+pseudo_r2 = 1 - ( mean_sum_log_liks / (nTrials_max*log(0.5)) )
+print(mean(pseudo_r2))
+```
+
+Are learning task learning rates associated with change in attribution tendencies on the causal attribution task (separate models)?
+
+```{r predict_thetas}
+# specify and load learning data model
+model <- "m_qlearning_negpos_2alpha_2q0i1_2q0i23"
+data_to_fit <- "b123"
+fit <- readRDS(file = paste0("./stan-fits/", model, "-", data_to_fit, "-", task_ver, "-fit.rds"))
+
+# extract posteriors
+params = c("alpha_pos", "alpha_neg", "beta")
+learning_posts <- as.data.frame(summary(fit, pars=params)$summary) %>%
+  dplyr::select(mean,sd) %>%
+  add_rownames(var = "var") %>%
+  separate(var, sep="\\[", into=c("parameter","uid"), remove=TRUE, extra="drop") %>%
+  separate(uid, sep=-1, into="uid", extra="drop")
+
+# specify and load causal attribution data model
+model_choice <- "m_bernoulli_negpos_IGcorr2_multisess_intervention_additive" 
+fit_choice <- readRDS(file = paste0("./stan-fits/", model_choice ,"-", task_ver, "-fit.rds"))
+
+# extract posteriors
+choice_posts <- as.data.frame(summary(fit_choice, pars = c("p_internal_pos", "p_internal_neg",
+                                               "p_global_pos", "p_global_neg"))$summary) %>%
+    dplyr::select(mean, sd) %>%
+    add_rownames(var = "var") %>%
+    separate(var, sep="\\[|\\,|\\]", into=c("parameter", "uid", "session"), 
+             remove=TRUE, extra="drop") 
+
+choice_deltas <- choice_posts %>%
+  pivot_wider(id_cols=c("uid", "session"), 
+              names_from = "parameter", values_from = c("mean", "sd")) %>%
+  arrange(uid, session) %>%
+  group_by(uid) %>%
+  mutate(delta_int_p_neg  = mean_p_internal_neg[session==2] - mean_p_internal_neg[session==1],
+         delta_int_p_pos  = mean_p_internal_pos[session==2] - mean_p_internal_pos[session==1],
+         delta_glob_p_neg = mean_p_global_neg[session==2] - mean_p_global_neg[session==1],
+         delta_glob_p_pos = mean_p_global_pos[session==2] - mean_p_global_pos[session==1]
+         ) %>%
+  dplyr::select(uid, contains("delta_")) %>%
+  distinct()
+
+# merge together choice and learning model params (separate fits)
+learning_params <- learning_posts %>%
+  pivot_wider(values_from = c("mean", "sd"), names_from = "parameter", id_cols = "uid")
+
+choice_learning <- merge(choice_deltas, learning_params, by="uid")
+
+# plot by group
+p3 <- choice_learning %>%
+  mutate(precision = 1/sd_alpha_pos,
+         condition = ifelse(uid %in% control_IDs, "control", "restructuring")) %>%
+  ggplot(aes(x=mean_alpha_pos, y=delta_int_p_pos, size = precision, weight=precision, 
+             group=condition, colour=condition, fill=condition)) +
+  geom_point() + 
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, formula = y~x) +
+  scale_colour_manual(values=colours3) + 
+  scale_fill_manual(values=colours3) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE) +
+  theme_minimal() + scale_size(guide = 'none') + theme(legend.position="none")
+
+p4 <- choice_learning %>%
+  mutate(precision = 1/sd_alpha_pos,
+         condition = ifelse(uid %in% control_IDs, "control", "restructuring")) %>%
+  ggplot(aes(x=mean_alpha_pos, y=delta_glob_p_pos, size = precision, weight=precision, 
+             group=condition, colour=condition, fill=condition)) +
+  geom_point() + 
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, formula = y~x) +
+  scale_colour_manual(values=colours3) + 
+  scale_fill_manual(values=colours3) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE) +
+  theme_minimal() + scale_size(guide = 'none')+ theme(legend.position="top")
+(p3 + p4)
+# ggsave(filename = paste0("./figures/", task_ver,"-", model, "-choice-learning-separate-models.svg"),
+#        plot = last_plot(), device = "svg", dpi = 300)
+```
+
+```{r lme}
+# quickly rearrange data
+choice_learning2 <- choice_learning %>%
+  mutate(uid = as.numeric(uid),
+         condition = ifelse(uid %in% control_IDs, "control", "psychoeducation")) %>%
+  dplyr::select(uid, condition, mean_alpha_pos, sd_alpha_pos, mean_beta,
+                contains("delta_")) %>%
+  distinct() %>%
+  arrange(uid)
+
+# internal-pos
+lm2 <- lm(delta_int_p_pos ~ mean_alpha_pos * condition,
+          weights = 1/sd_alpha_pos,
+          data = choice_learning2)
+summary(lm2)
+
+# global-pos
+lm2 <- lm(delta_glob_p_pos ~ mean_alpha_pos * condition, 
+          weights = 1/sd_alpha_pos,
+          data=choice_learning2)
+summary(lm2)
+
+# compare correlations between conditions using Fisher's R-to-Z test (extracted from weighted correlations):
+wts <- choice_learning2 %>%
+  filter(condition=="psychoeducation") 
+tmp <- choice_learning2 %>%
+  filter(condition=="psychoeducation") %>%
+  dplyr::select(mean_alpha_pos, delta_int_p_pos, delta_glob_p_pos)
+weighted_corr <- cov.wt(tmp, wt = 1/wts$sd_alpha_pos, cor = TRUE)
+corr <- weighted_corr$cor
+
+wts <- choice_learning2 %>%
+  filter(condition=="control") 
+tmp <- choice_learning2 %>%
+  filter(condition=="control") %>%
+  dplyr::select(mean_alpha_pos, delta_int_p_pos, delta_glob_p_pos)
+weighted_corr <- cov.wt(tmp, wt = 1/wts$sd_alpha_pos, cor = TRUE)
+corr <- weighted_corr$cor
+
+paired.r(0.27, 0.21, n=200)
+
+paired.r(0.21, 0.04, n=200)
+```
+
+So looks like there might be some association - what if we fit the data from the two tasks jointly?
+
+```{r arrange_data_joint}
+# rejig the data so we have everything we need
+data_long_all_learning <- data_long_all %>%
+  dplyr::select(uid, ID, trialNo, itemNo, blockNo, valence, chosen_attr_type, correct, rt) %>%
+  mutate(valence01 = ifelse(valence == "negative", 0, 
+                        ifelse(valence == "positive", 1, NA)),
+         choiceIG = ifelse(chosen_attr_type == "internal_global", 2, 1),
+         choiceIG01 = ifelse(chosen_attr_type == "internal_global", 1, 0)) %>%
+  group_by(uid) %>%
+  mutate(newTrialNo = 1:n()) %>%
+  ungroup() %>%
+  arrange(uid)
+
+data_long_all_choice <- read.csv(file=paste0(task_ver, "-causal-attribution-task-data-anon.csv")) %>%
+  dplyr::select(-X) %>%
+  arrange(uid)
+
+# check everything is aligned properly
+nPpts_c <- length(unique(data_long_all_learning$uid))
+nPpts_l <- length(unique(data_long_all_choice$uid))
+nPpts_c==nPpts_l
+unique(data_long_all_learning$uid)==unique(data_long_all_choice$uid)
+unique(data_long_all_learning$ID)==unique(data_long_all_choice$ID)
+
+# organise the data for rstan
+nPpts <- nPpts_c
+nTrials_max_l <- max(data_long_all_learning$newTrialNo)
+nTrials_max_c <- max(data_long_all_choice$nTrials)
+nTimes <- max(data_long_all_choice$sess)
+  
+blockNo <- valence <- choiceIG <- choiceIG01 <- outcome <- array(0, dim = c(nPpts, nTrials_max_l))
+nT_ppts_l <- array(nTrials_max_l, dim = c(nPpts))
+
+internalChosen_neg <- internalChosen_pos <- globalChosen_neg <- globalChosen_pos <- array(0, dim = c(nPpts, nTimes, nTrials_max_c/2))
+nT_ppts_c <- array(nTrials_max_c, dim = c(nPpts, nTimes))
+
+for (p in 1:nPpts) {
+  blockNo[p,]   <- with(data_long_all_learning, blockNo[ID==p])
+  valence[p,]   <- with(data_long_all_learning, valence01[ID==p])
+  choiceIG[p,]  <- with(data_long_all_learning, choiceIG[ID==p])
+  choiceIG01[p,]<- with(data_long_all_learning, choiceIG01[ID==p])
+  outcome[p,]   <- with(data_long_all_learning, correct[ID==p])
+  for (t in 1:nTimes) {
+    internalChosen_neg[p,t,] <- with(data_long_all_choice, internalChosen[ID==p & sess==t & neg_pos==0])
+    internalChosen_pos[p,t,] <- with(data_long_all_choice, internalChosen[ID==p & sess==t & neg_pos==1])
+    globalChosen_neg[p,t,] <- with(data_long_all_choice, globalChosen[ID==p & sess==t & neg_pos==0])
+    globalChosen_pos[p,t,] <- with(data_long_all_choice, globalChosen[ID==p & sess==t & neg_pos==1])
+  }
+}
+
+# create data list to pass to stan
+data_list = list(
+  # overall
+  nPpts = nPpts,
+  nTimes = nTimes,
+  # learning task data
+  nTrials_max_l = nTrials_max_l,     # max number of trials [per session] per participant
+  nT_ppts_l = nT_ppts_l,             # actual number of trials [per session] per participant
+  blockNo = blockNo,
+  valence = valence,
+  nChoices_l = 2,
+  choice = choiceIG,
+  outcome = outcome,
+  # causal attribution task data
+  nTrials_max_c = nTrials_max_c/2,         # max number of trials per  session per participant
+  nT_ppts_c = nT_ppts_c/2,                 # actual number of trials per session per participant
+  condition = int_conds$condition01,       # 0 = control, 1 = psychoed
+  internal_neg = internalChosen_neg,
+  internal_pos = internalChosen_pos,
+  global_neg = globalChosen_neg,
+  global_pos = globalChosen_pos
+)
+```
+
+We can fit two different joint models, one with just an overall association between learning task learning rates (for positive events) and change in internal-positive attributions at t2 (on the causal attribution task), and one which allows for an additional effect in participants who received the cognitive restructuring intervention.
+
+```{r fit_joint_1}
+## joint model 1:
+model <- "m_bernoulli_negpos_IGcorr2_multisess_intervention_additive_joint_Qlearning4_bothg_IG"
+
+## fit model using rstan
+fit <- stan(
+  file = paste0("./stan-models/", model, ".stan"),
+  data = data_list,
+  chains = 4,               # run 4 separate chains to assess convergence
+  warmup = 1000,            # these are used to tune the sampler and ’burn in’
+  iter = 2000,              # number of iterations (#kept = chains*(iter - warmup))
+  cores = nCores            # chains to be run in parallel on separate cores (if possible)
+)
+
+## save
+saveRDS(fit, file = paste0("./stan-fits/", model ,"-", task_ver, "-fit.rds"))
+# ## OR load model from file
+# fit <- readRDS(file = paste0("./stan-fits/", model ,"-", task_ver, "-fit.rds"))
+
+# summary of sampling diagnostics
+check_hmc_diagnostics(fit)
+
+# get posterior estimates for effects of interest (raw / unstandardized):
+params90cis <- summary(fit, pars = c("theta_int_internal_neg", "theta_int_internal_pos",
+                                     "theta_int_global_neg", "theta_int_global_pos",
+                                     "beta_both_internal", "beta_both_global"), 
+                       probs = c(0.10, 0.90))$summary
+print(params90cis)
+
+# plot using tidybayes
+fit_tidy <- fit %>% 
+  gather_draws(beta_both_internal, beta_both_global, 
+               beta_activ_internal, beta_activ_global) %>%
+  mutate(
+         var_type = ifelse(grepl("_int_", .variable), "intervention effect", 
+                           ifelse(grepl("beta_", .variable), "learning", "group mean")),
+         var_type = factor(var_type, levels = c("group mean", "intervention effect", "learning")),
+         .variable = factor(.variable, levels = c(
+           "beta_both_internal", "beta_both_global"
+           )))
+
+## new plotting: standardized effects
+## convert to standardized
+# beta_b1_std =  sqrt(sigma_thetas[1]) / sqrt(pars_sigma_pos[1]) * beta_b1
+# beta_int1_std = sqrt(sigma_thetas[1]) / sqrt(pars_sigma_pos[3]) * beta_int1
+# first, get posterior (pooled) variance estimates for theta_internal_pos at each time point
+params90cis <- summary(fit, pars = c("pars_sigma_neg[3]",
+                                     "pars_sigma_neg[4]", 
+                                     "pars_sigma_pos[3]",
+                                     "pars_sigma_pos[4]"), probs = c(0.1, 0.9))$summary
+sigma_theta_int_pos_t2 <- params90cis[3,1]
+sigma_theta_glob_pos_t2 <- params90cis[4,1]
+# for betas, which are non hierarchically estimates, we will have to take the SD across posterior mean estimates
+tmp  <- summary(fit, pars = "alpha_pos", probs = c(0.1, 0.9))$summary
+sd_alpha_pos <- sd(tmp[,1])
+
+fit_tidy2 <- fit_tidy %>%
+  mutate(.value2 = case_when(.variable =="beta_both_internal" ~ sd_alpha_pos/sqrt(sigma_theta_int_pos_t2) *.value,
+                              .variable =="beta_both_global" ~ sd_alpha_pos/sqrt(sigma_theta_glob_pos_t2) *.value))
+         
+p2 <- fit_tidy2 %>%
+  ggplot(aes(y = fct_rev(.variable), x = .value2, fill = var_type)) +
+  stat_gradientinterval(.width = c(.9, .5),  slab_size = 1) +
+  scale_fill_manual(values = colours2) +
+  geom_vline(xintercept = 0, colour = "grey") + theme_minimal() +
+  theme(legend.position = "none") + theme(aspect.ratio=1.5/7) + labs(x="", y="") +
+  theme(axis.text.x = element_text(size = 10))
+p2
+# ggsave(filename = paste0("./figures/", task_ver, "-", model,
+#                          "-joint-model-1-smd.svg"),
+#       plot = last_plot(), device = "svg", dpi = 300)
+```
+
+
+```{r fit_joint_2}
+## joint model 2:
+model <- "m_bernoulli_negpos_IGcorr2_multisess_intervention_additive_joint_Qlearning4_bothg_activ_IG"
+
+## fit model using rstan
+fit <- stan(
+  file = paste0("./stan-models/", model, ".stan"),
+  data = data_list,
+  chains = 4,               # run 4 separate chains to assess convergence
+  warmup = 1000,            # these are used to tune the sampler and ’burn in’
+  iter = 2000,              # number of iterations (#kept = chains*(iter - warmup))
+  cores = nCores            # chains to be run in parallel on separate cores (if possible)
+)
+
+## save
+saveRDS(fit, file = paste0("./stan-fits/", model ,"-", task_ver, "-fit.rds"))
+# ## OR load model from file
+# fit <- readRDS(file = paste0("./stan-fits/", model ,"-", task_ver, "-fit.rds"))
+
+# summary of sampling diagnostics
+check_hmc_diagnostics(fit)
+
+# get posterior estimates for effects of interest (raw / unstandardized):
+params90cis <- summary(fit, pars = c("theta_int_internal_neg", "theta_int_internal_pos",
+                                     "theta_int_global_neg", "theta_int_global_pos",
+                                     "beta_both_internal", "beta_both_global",
+                                     "beta_activ_internal", "beta_activ_global"), 
+                       probs = c(0.10, 0.90))$summary
+print(params90cis)
+
+# plot using tidybayes
+fit_tidy <- fit %>% 
+  gather_draws(beta_both_internal, beta_both_global, 
+               beta_activ_internal, beta_activ_global) %>%
+  mutate(
+         var_type = ifelse(grepl("_int_", .variable), "intervention effect", 
+                           ifelse(grepl("beta_", .variable), "learning", "group mean")),
+         var_type = factor(var_type, levels = c("group mean", "intervention effect", "learning")),
+         .variable = factor(.variable, levels = c(
+           "beta_both_internal", "beta_both_global", 
+           "beta_activ_internal", "beta_activ_global"
+           )))
+
+## new plotting: standardized effects
+## convert to standardized
+# beta_b1_std =  sqrt(sigma_thetas[1]) / sqrt(pars_sigma_pos[1]) * beta_b1
+# beta_int1_std = sqrt(sigma_thetas[1]) / sqrt(pars_sigma_pos[3]) * beta_int1
+# first, get posterior (pooled) variance estimates for theta_internal_pos at each time point
+params90cis <- summary(fit, pars = c("pars_sigma_neg[3]",
+                                     "pars_sigma_neg[4]", 
+                                     "pars_sigma_pos[3]",
+                                     "pars_sigma_pos[4]"), probs = c(0.1, 0.9))$summary
+sigma_theta_int_pos_t2 <- params90cis[3,1]
+sigma_theta_glob_pos_t2 <- params90cis[4,1]
+# for betas, which are non hierarchically estimates, we will have to take the SD across posterior mean estimates
+tmp  <- summary(fit, pars = "alpha_pos", probs = c(0.1, 0.9))$summary
+sd_alpha_pos <- sd(tmp[,1])
+
+fit_tidy2 <- fit_tidy %>%
+  mutate(.value2 = case_when(.variable =="beta_both_internal" ~ sd_alpha_pos/sqrt(sigma_theta_int_pos_t2) *.value,
+                              .variable =="beta_both_global" ~ sd_alpha_pos/sqrt(sigma_theta_glob_pos_t2) *.value,
+                               .variable =="beta_activ_internal" ~ sd_alpha_pos/sqrt(sigma_theta_int_pos_t2) *.value,
+                               .variable =="beta_activ_global" ~ sd_alpha_pos/sqrt(sigma_theta_glob_pos_t2) *.value,
+                             TRUE ~ .value))
+p2 <- fit_tidy2 %>%
+  ggplot(aes(y = fct_rev(.variable), x = .value2, fill = var_type)) +
+  stat_gradientinterval(.width = c(.9, .5),  slab_size = 1) +
+  scale_fill_manual(values = colours2) +
+  geom_vline(xintercept = 0, colour = "grey") + theme_minimal() +
+  theme(legend.position = "none") + theme(aspect.ratio=1.5/7) + labs(x="", y="") +
+  theme(axis.text.x = element_text(size = 10))
+p2
+# ggsave(filename = paste0("./figures/", task_ver, "-", model,
+#                          "-joint-model-2-msd.svg"),
+#       plot = last_plot(), device = "svg", dpi = 300)
+```
+
+```{r mc_joint_qlearning}
+## comparison between models
+models_to_compare <- c("m_bernoulli_negpos_IGcorr2_multisess_intervention_additive",
+                       "m_bernoulli_negpos_IGcorr2_multisess_intervention_additive_joint_Qlearning4_bothg_IG",
+                       "m_bernoulli_negpos_IGcorr2_multisess_intervention_additive_joint_Qlearning4_bothg_activ_IG"
+                       )
+# we can use the loo_compare function to compare our two models on expected log predictive density (ELPD) for new data
+for (i in 1:length(models_to_compare)) {
+  fit <- readRDS(paste0("./stan-fits/",models_to_compare[i], "-",task_ver,"-fit.rds"))
+  assign(paste0("loo",as.character(i)), loo(fit, mc.cores = nCores)) 
+}
+loo_compare(loo1, loo2, loo3) 
+```
+
+Are learning rates associated with other learning task data (ratings, free-text classification label probabilites?)
+
+1. Correlations with ratings data
+
+```{r ratings}
+# load ratings data 
+data_r_long_all <- read.csv(file = paste0(task_ver, "-learning-task-ratings-data-anon.csv")) %>%
+  dplyr::select(-X)
+```
+
+First, lets look at the data and see if ratings ratings are sensitive to ground truth contingencies and/or change over the course of the task
+
+```{r ratings_plot}
+p1 <- data_r_long_all %>%
+  melt(id.vars=c("uid", "block", "valence")) %>%
+  group_by(variable, valence, block) %>%
+  summarise(mean = mean(value),
+            sd = sd(value),
+            se = sd(value)/sqrt(nPpts)) %>%
+  ggplot(aes(x=block, y=mean, group=valence, fill=valence)) +
+  geom_hline(yintercept = c(50), linetype = "dotted") +
+  geom_bar(stat="Identity", position=position_dodge2(0.8), width=0.5) +
+  geom_errorbar(aes(ymin=mean-se, ymax=mean+se),
+                colour="black", position = position_dodge2(width=0.4, padding=0.4), width=0.5) +
+  theme_minimal() + theme(legend.position = "top") + ylim(0,100) + xlab("post-block") + 
+  ylab("mean (se) rating") + facet_wrap(~variable) +
+  #scale_x_discrete(labels=c("last2weeks", "int-ext", "glob-spec","glob-spec")) +
+  theme(axis.text.x = element_text(angle = 45, vjust=1, hjust=1)) + 
+  scale_fill_brewer(palette="Set2") + scale_colour_brewer(palette="Set2")
+p1
+
+labs <- c("external-internal", "specific-global")
+names(labs) <- c("ext_int", "spec_glob")
+rp1 <- data_r_long_all %>%
+  melt(id.vars=c("uid", "block", "valence")) %>%
+  mutate(valence=recode(valence, `neg`="negative",`pos`="positive"),
+         block=recode(block,
+                      `block0` = "pre-task",
+                      `block1` = "scenario 1",
+                      `block2` = "scenario 2",
+                      `block3` = "scenario 3")) %>%
+  ggplot(aes(x=block, y=value, group=interaction(block,valence), fill=valence, 
+             colour=valence)) +
+  geom_hline(yintercept = c(50), linetype = "dotted") +
+  geom_flat_violin(position=position_nudge(x = .1, y = 0),  
+                        adjust = 1.5, trim = TRUE, alpha = .4, colour = NA) +
+  geom_point(position=position_jitter(width=.1), size = 2, shape = 20) +
+  geom_line(aes(group=interaction(uid,block)), colour="grey", alpha = .4) +
+  geom_boxplot(outlier.shape = NA, alpha = .5, width = .3, colour = "black") +
+  theme_minimal() + ylim(0,100) +
+  labs(x="", y="explicit cause rating") +
+  theme(legend.title = element_blank()) + theme(legend.position="top") +
+  facet_wrap(~blockNo, nrow=1) + facet_wrap(~variable, labeller = labeller(variable = labs)) +
+  #scale_x_discrete(labels=c("last2weeks", "int-ext", "glob-spec","glob-spec", "int-ext")) +
+  scale_fill_brewer(palette="Set2") + scale_colour_brewer(palette="Set2")
+rp1
+```
+
+```{r ratings_lm}
+data_r_long_all2 <- data_r_long_all %>%
+  filter(!block=="block0") %>%
+  melt(id_cols=c("uid", "valence", "block"))
+
+lm <- lmer(value ~ variable * valence * block + (1 | uid),
+           data = data_r_long_all2)
+summary(lm)
+anova(lm)
+```
+
+Now, see if the they are correlated with point (posterior mean) learning rate estimates
+
+```{r ratings_corr}
+data_r_wider_all <- data_r_long_all %>%
+  pivot_wider(id_cols = c("uid", "block"), values_from = c("ext_int", "spec_glob"), 
+              names_from = c("valence")) %>%
+  arrange(uid)
+
+# get key linking numeric sequential IDs in model outtput back to original prolific identifiers
+ID_trans <- data_long_all %>%
+  dplyr::select(uid, ID) %>%
+  distinct()
+
+# merge ratings with causal attribution task posteriors data
+model <-  "m_qlearning_negpos_2alpha_2q0i1_2q0i23"
+data_to_fit <- "b123"
+fit <- readRDS(file = paste0("./stan-fits/", model, "-", data_to_fit, "-", task_ver, "-fit.rds"))
+
+params <- c("alpha_neg", "alpha_pos", "beta", "q0_1_IG_pos")
+
+learning_posts <- as.data.frame(summary(fit, pars=params)$summary) %>%
+  dplyr::select(mean,sd) %>%
+  add_rownames(var = "var") %>%
+  separate(var, sep="\\[", into=c("parameter","ID"), remove=TRUE, extra="drop") %>%
+  separate(ID, sep=-1, into="ID", extra="drop") %>%
+  pivot_wider(id_cols = "ID", names_from = "parameter", values_from = c("mean", "sd"))
+
+posts_uids <- merge(learning_posts, ID_trans, by="ID")
+posts_r <- merge(posts_uids, data_r_wider_all, by = "uid")
+  
+p <- posts_r %>%
+  mutate(precision = 1/sd_alpha_pos) %>%
+  ggplot(aes(x=mean_alpha_pos, y=ext_int_pos, size = precision, weight=precision, 
+             )) +
+  geom_point() + 
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, formula = y~x) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE,
+               label.x = "right", label.y = "bottom") +
+  theme_minimal() + theme(legend.position="none") + facet_wrap(~block)
+p
+
+p <- posts_r %>%
+  mutate(precision = 1/sd_alpha_pos) %>%
+  ggplot(aes(x=mean_alpha_pos, y=spec_glob_pos, size = precision, weight=precision, 
+             )) +
+  geom_point() + 
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, formula = y~x) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE,
+               label.x = "right", label.y = "bottom") +
+  theme_minimal() + theme(legend.position="none") + facet_wrap(~block)
+p
+```
+
+We can also analyse this more formally via lme models, accounting for other parameter values
+
+```{r ratings_lm}
+posts_r_2 <- posts_r %>%
+  filter(!block=="block0") %>%
+  mutate(b = ifelse(block=="block1", 1,
+                    ifelse(block=="block2", 2, 3)),
+         ext_int_pos_z = scale(ext_int_pos),
+         spec_glob_pos_z = scale(spec_glob_pos),
+         mean_alpha_pos_z = scale(mean_alpha_pos),
+         mean_beta_z = scale(mean_beta))
+
+lm <- lmer(ext_int_pos_z ~ mean_alpha_pos_z + b + mean_beta_z + (1 | uid), data=posts_r_2, 
+           weights = 1/sd_alpha_pos)
+summary(lm)
+anova(lm)
+
+
+lm <- lmer(spec_glob_pos_z ~ mean_alpha_pos_z + b + mean_beta_z + (1 | uid), data=posts_r_2, 
+           weights = 1/sd_alpha_pos)
+summary(lm)
+anova(lm)
+```
+
+2. NLP classification label probabilities
+
+```{r nlp}
+data_ft_class <- read.csv(file = paste0(task_ver,
+                                        "-learning-task-free-text-descriptions-classified-anon.csv"))
+
+data_ft_class_long <- data_ft_class %>%
+  dplyr::select(uid, contains("classifier")) %>%
+  melt(id.vars="uid") %>%
+  separate(variable, into=c("scenario", "valence", "classifier", "label"), sep="_", extra="drop") %>%
+  mutate(valence=recode(valence, `neg`="negative",`pos`="positive"),
+         label = recode(label, 
+                        `myself` = "myself",
+                        `other.people` = "other people",
+                        `specific.situations` = "specific situations",
+                        `in.general` = "in general"
+                        ))
+data_ft_class_long$label <- factor(data_ft_class_long$label, 
+                                levels=c("myself","other people","specific situations","in general"))
+
+rp1 <- data_ft_class_long %>%
+  ggplot(aes(x=classifier, y=value, group=interaction(scenario,label), fill=label, 
+             colour=label)) +
+       geom_flat_violin(position=position_nudge(x = .1, y = 0),  
+                        adjust = 1.5, trim = TRUE, alpha = .4, colour = NA) +
+       geom_point(position=position_jitter(width=.1), size = 1, shape = 20) +
+       #geom_line(aes(group=uid), colour="grey", alpha = .4) +
+       geom_boxplot(outlier.shape = NA, alpha = .7, width = .3, colour = "black") +
+       theme_minimal() + ylim(0,1) +
+       labs(x="", y="classifier label score for free-text description") +
+       theme(legend.title = element_blank()) + theme(legend.position="top") +
+  facet_grid(rows=vars(scenario), cols=vars(valence)) 
+rp1
+```
+
+```{r ft_lm}
+lm <- lmer(value ~ scenario * valence * label + (1 | uid), 
+           data=data_ft_class_long)
+summary(lm)
+anova(lm)
+
+data_ft_class_long2 <- data_ft_class_long %>%
+  filter(label=="myself" | label=="other people")
+lm <- lmer(value ~ scenario * valence * label + (1 | uid), 
+           data=data_ft_class_long2)
+summary(lm)
+anova(lm)
+
+data_ft_class_long3 <- data_ft_class_long %>%
+  filter(label=="in general" | label=="specific situations")
+lm <- lmer(value ~ scenario * valence * label + (1 | uid), 
+           data=data_ft_class_long3)
+summary(lm)
+anova(lm)
+```
+
+```{r ft_corr}
+data_ft_wider_all <- data_ft_class_long %>%  #data_ft_class_long_t
+  dplyr::select(-classifier) %>%
+  pivot_wider(id_cols = c("uid", "scenario"), values_from = c("value"), 
+              names_from = c("valence", "label")) %>%
+  arrange(uid)
+
+# get key linking numeric sequential IDs in model outtput back to original identifiers
+ID_trans <- data_long_all %>%
+  dplyr::select(uid, ID) %>%
+  distinct()
+
+# merge sx into posts data
+model <-  "m_qlearning2_negpos_2alpha_2q0i1_2q0i23"
+data_to_fit <- "b123"
+fit <- readRDS(file = paste0("./stan-fits/", model, "-", data_to_fit, "-", task_ver, "-fit.rds"))
+
+params <- c("alpha_pos", "beta")
+
+learning_posts <- as.data.frame(summary(fit, pars=params)$summary) %>%
+  dplyr::select(mean,sd) %>%
+  add_rownames(var = "var") %>%
+  separate(var, sep="\\[", into=c("parameter","ID"), remove=TRUE, extra="drop") %>%
+  separate(ID, sep=-1, into="ID", extra="drop") %>%
+  pivot_wider(id_cols = "ID", names_from = "parameter", values_from = c("mean", "sd"))
+
+posts_uids <- merge(learning_posts, ID_trans, by="ID")
+posts_ft <- merge(posts_uids, data_ft_wider_all, by = "uid")
+  
+p <- posts_ft %>%
+  mutate(precision = 1/sd_alpha_pos) %>%
+  ggplot(aes(x=mean_alpha_pos, y=`positive_myself`, size = precision, weight=precision, 
+             )) +
+  geom_point() + 
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, formula = y~x) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE,
+               label.x = "right", label.y = "top") + ylim(0,1.1) +
+  theme_minimal() + theme(legend.position="none") + facet_wrap(~scenario)
+p
+
+p <- posts_ft %>%
+  mutate(precision = 1/sd_alpha_pos) %>%
+  ggplot(aes(x=mean_alpha_pos, y=`positive_other people`, size = precision, weight=precision, 
+             )) +
+  geom_point() + 
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, formula = y~x) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE,
+               label.x = "right", label.y = "top") + ylim(0,1.1) +
+  theme_minimal() + theme(legend.position="none") + facet_wrap(~scenario)
+p
+
+p <- posts_ft %>%
+  mutate(precision = 1/sd_alpha_pos) %>%
+  ggplot(aes(x=mean_alpha_pos, y=`positive_in general`, size = precision, weight=precision, 
+             )) +
+  geom_point() + 
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, formula = y~x) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE,
+               label.x = "right", label.y = "top") + ylim(0,1.1) +
+  theme_minimal() + theme(legend.position="none") + facet_wrap(~scenario)
+p
+
+p <- posts_ft %>%
+  mutate(precision = 1/sd_alpha_pos) %>%
+  ggplot(aes(x=mean_alpha_pos, y=`positive_specific situations`, size = precision, weight=precision, 
+             )) +
+  geom_point() + 
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, formula = y~x) + ylim(0,1.1) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE,
+               label.x = "right", label.y = "top") +
+  theme_minimal() + theme(legend.position="none") + facet_wrap(~scenario)
+p
+```
+
+```{r ft_lm2}
+posts_r_2 <- posts_ft %>%
+  mutate(b = ifelse(scenario=="scenario1", 1,
+                    ifelse(scenario=="scenario2", 2, 3)),
+         mean_alpha_pos_z = scale(mean_alpha_pos),
+         mean_beta_z = scale(mean_beta))
+
+lm <- lmer(positive_myself ~ mean_alpha_pos_z + b + mean_beta_z + (1 | uid), data=posts_r_2, 
+           weights = 1/sd_alpha_pos)
+summary(lm)
+anova(lm)
+
+lm <- lmer(`positive_other people` ~ mean_alpha_pos_z + b + mean_beta_z + (1 | uid), data=posts_r_2,
+           weights = 1/sd_alpha_pos)
+summary(lm)
+anova(lm)
+```
+
+
+Are explicit ratings and free-text class labels tapping the same information?
+
+```{r ratings_ft_corr}
+data_r_wider_all2 <- data_r_wider_all %>%
+  filter(!block=="block0") %>%
+  mutate(scenario = ifelse(block=="block1", "scenario1",
+                           ifelse(block=="block2", "scenario2", "scenario3"))) %>%
+  dplyr::select(-block)
+
+ratings_ft_wide <- merge(data_r_wider_all2, data_ft_wider_all, by = c("uid", "scenario"))
+
+p <- ratings_ft_wide %>%
+  ggplot(aes(x=ext_int_neg, y=negative_myself)) +
+  geom_point() + 
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, formula = y~x) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE,
+               label.x = "right", label.y = "top") +
+  theme_minimal() + theme(legend.position="none") + facet_wrap(~scenario)
+p
+
+p <- ratings_ft_wide %>%
+  ggplot(aes(x=ext_int_neg, y=`negative_other people`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, formula = y~x) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE,
+               label.x = "right", label.y = "top") +
+  theme_minimal() + theme(legend.position="none") + facet_wrap(~scenario)
+p
+
+p <- ratings_ft_wide %>%
+  ggplot(aes(x=ext_int_pos, y=positive_myself)) +
+  geom_point() + 
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, formula = y~x) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE,
+               label.x = "left", label.y = "top") +
+  theme_minimal() + theme(legend.position="none") + facet_wrap(~scenario)
+p
+
+p <- ratings_ft_wide %>%
+  ggplot(aes(x=ext_int_pos, y=`positive_other people`)) +
+  geom_point() +
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, formula = y~x) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE,
+               label.x = "left", label.y = "top") +
+  theme_minimal() + theme(legend.position="none") + facet_wrap(~scenario)
+p
+
+p <- ratings_ft_wide %>%
+  ggplot(aes(x=spec_glob_neg, y=`negative_in general`)) +
+  geom_point() + 
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, formula = y~x) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE,
+               label.x = "right", label.y = "top") +
+  theme_minimal() + theme(legend.position="none") + facet_wrap(~scenario)
+p
+
+p <- ratings_ft_wide %>%
+  ggplot(aes(x=spec_glob_pos, y=`positive_in general`)) +
+  geom_point() + 
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, formula = y~x) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE,
+               label.x = "right", label.y = "top") +
+  theme_minimal() + theme(legend.position="none") + facet_wrap(~scenario)
+p
+
+p <- ratings_ft_wide %>%
+  ggplot(aes(x=spec_glob_neg, y=`negative_specific situations`)) +
+  geom_point() + 
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, formula = y~x) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE,
+               label.x = "right", label.y = "top") +
+  theme_minimal() + theme(legend.position="none") + facet_wrap(~scenario)
+p
+
+p <- ratings_ft_wide %>%
+  ggplot(aes(x=spec_glob_pos, y=`positive_specific situations`)) +
+  geom_point() + 
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, formula = y~x) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE,
+               label.x = "right", label.y = "top") +
+  theme_minimal() + theme(legend.position="none") + facet_wrap(~scenario)
+p
+```
+
+```{r ratings_ft_corrmat}
+tmp1 <- ratings_ft_wide %>%
+  dplyr::select(uid, 
+                ext_int_neg, spec_glob_neg, 
+                negative_myself, `negative_in general`) %>%
+  group_by(uid) %>%
+  summarise_at(vars(-group_cols()), mean) %>%
+  dplyr::select(-uid)
+
+corr1 <- round(cor(tmp1), 2)
+ggcorrplot(corr1, hc.order = TRUE, type = "upper", outline.col = "white",
+             colors = c("#6D9EC1", "white", "#E46726"))
+
+tmp2 <- ratings_ft_wide %>%
+  dplyr::select(uid, 
+                ext_int_pos, spec_glob_pos,
+                positive_myself, `positive_in general`) %>%
+  group_by(uid) %>%
+  summarise_at(vars(-group_cols()), mean) %>%
+  dplyr::select(-uid)
+
+corr2 <- round(cor(tmp2), 2)
+ggcorrplot(corr2, hc.order = TRUE, type = "upper", outline.col = "white",
+             colors = c("#6D9EC1", "white", "#E46726"))
+
+```
+
+```{r explor_regress}
+posts_r2 <- posts_r %>%
+  filter(!block=="block0") %>%
+  mutate(scenario = ifelse(block=="block1", "scenario1",
+                           ifelse(block=="block2", "scenario2", "scenario3"))) %>%
+  dplyr::select(-block)
+
+posts_r_ft <- merge(posts_r2, posts_ft, by=c("uid", "ID", "scenario",
+                                             "mean_alpha_pos", "sd_alpha_pos",
+                                             "mean_beta", "sd_beta")) %>%
+  dplyr::select(-scenario) %>%
+  mutate(ID = as.numeric(ID)) %>%
+  group_by(uid) %>%
+  summarise_all(.funs = "mean") %>%
+  mutate(ext_int_pos_z = scale(ext_int_pos),
+         spec_glob_pos_z = scale(spec_glob_pos),
+         pos_myself_z = scale(positive_myself),
+         pos_other.people_z = scale(`positive_other people`),
+         pos_in.general_z = scale(`positive_in general`),
+         pos_specific.situations_z = scale(`positive_specific situations`))
+
+tmp <- posts_r_ft %>%
+  dplyr::select(mean_alpha_pos, mean_beta, ext_int_pos, spec_glob_pos, pos_myself, pos_in.general)
+
+weighted_corr <- cov.wt(tmp, wt = 1/posts_r_ft$sd_alpha_pos, cor = TRUE)
+corr <- weighted_corr$cor
+ggcorrplot(corr, hc.order = FALSE, type = "upper", outline.col = "white", 
+             colors = c("#6D9EC1", "white", "#E46726"))
+# ggsave(filename = paste0("./figures/", task_ver, "-corr-plot-params-ratings-nlp.svg"),
+#        plot = last_plot(), device = "svg", dpi = 300)
+```
+
+Finally, what about relationships with self-reported demographic and clinical data
+
+```{r ratings_ft_demogs}
+# load self-report data 
+data_quest_wide_all <- read.csv(file=paste0(task_ver, "-self-report-data-anon.csv")) %>%
+  dplyr::select(-X)
+
+# merge together and rescore some of the data
+data_quest_wide_all <- data_quest_wide_all %>%
+  mutate(age_z = scale(demogs_age),
+         gender01 = ifelse(demogs_gender=="man",0,1),
+         gender01_z = scale(gender01),
+         demogs_tx01 = ifelse(grepl("yes", demogs_tx), 1, 0),
+         demogs_tx01_z = scale(demogs_tx01),
+         demogs_talking = ifelse(grepl("talking therapy", demogs_tx), 1, 0),
+         demogs_talking_z = scale(demogs_talking),
+         neurodiv01 = ifelse(grepl("yes", demogs_neurodiv), 1, 0),
+         neurodiv01_z = scale(neurodiv01),
+         PHQ9_total_z = scale(PHQ9_total),
+         miniSPIN_total_z = scale(miniSPIN_total),
+         DAS_total_z = scale(DAS_total)
+         )
+posts_r_ft_demogs <- merge(posts_r_ft, data_quest_wide_all, by="uid")
+
+tmp2 <- posts_r_ft_demogs %>%
+  dplyr::select(mean_alpha_pos, age_z, gender01_z, neurodiv01_z, demogs_tx01_z, demogs_talking_z,
+                PHQ9_total_z, DAS_total_z, miniSPIN_total_z)
+
+# look at corr matrix
+weighted_corr <- cov.wt(tmp2, wt = 1/posts_r_ft_demogs$sd_alpha_pos, cor = TRUE)
+corr <- weighted_corr$cor
+ggcorrplot(corr, hc.order = FALSE, type = "upper", outline.col = "white", 
+             colors = c("#6D9EC1", "white", "#E46726"))
+# ggsave(filename = paste0("./figures/", task_ver, "-corr-plot-demogs.svg"),
+#        plot = last_plot(), device = "svg", dpi = 300)
+
+# and plot some bivariate relationships
+a <- posts_r_ft_demogs %>%
+  mutate(precision = 1/sd_alpha_pos) %>%
+  ggplot(aes(x=PHQ9_total, y=mean_alpha_pos, size = precision, weight = precision)) +
+  geom_point(colour="lightcoral") + 
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, color="grey", formula = y~x) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE,
+               label.x = "right", label.y = "top") +
+  theme_minimal() + theme(legend.position="none") 
+
+b <- posts_r_ft_demogs %>%
+  mutate(precision = 1/sd_alpha_pos) %>%
+  ggplot(aes(x=demogs_age, y=mean_alpha_pos, size = precision, weight = precision)) +
+  geom_point(colour="deepskyblue") + 
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, color="grey", formula = y~x) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE,
+               label.x = "right", label.y = "top") +
+  theme_minimal() + theme(legend.position="none") 
+
+c <- posts_r_ft_demogs %>%
+  dplyr::select(uid, mean_alpha_pos, gender01) %>%
+  mutate(gender = ifelse(gender01==0, "man", "woman, non-binary or other")) %>%
+  ggplot(aes(x=gender, y=mean_alpha_pos, group=gender,
+             fill=gender, colour=gender)) +
+       geom_flat_violin(position=position_nudge(x = .1, y = 0),  
+                        adjust = 1.5, trim = TRUE, alpha = .4, colour = NA) +
+       geom_point(position=position_jitter(width=.02), size = 3, shape = 20) +
+       geom_boxplot(outlier.shape = NA, alpha = .5, width = .3, colour = "black") +
+       theme_minimal() + labs(x="gender", y="") + 
+       theme(legend.title = element_blank()) + theme(legend.position = "none") +
+       scale_fill_manual(values=wes_palette(n=2, name="Moonrise3")) +
+       scale_colour_manual(values=wes_palette(n=2, name="Moonrise3")) 
+
+d <- posts_r_ft_demogs %>%
+  dplyr::select(uid, mean_alpha_pos, demogs_talking) %>%
+  mutate(talking_tx = ifelse(demogs_talking==0, "no", "yes")) %>%
+  ggplot(aes(x=talking_tx, y=mean_alpha_pos, group=talking_tx,
+             fill=talking_tx, colour=talking_tx)) +
+       geom_flat_violin(position=position_nudge(x = .1, y = 0),  
+                        adjust = 1.5, trim = TRUE, alpha = .4, colour = NA) +
+       geom_point(position=position_jitter(width=.02), size = 3, shape = 20) +
+       geom_boxplot(outlier.shape = NA, alpha = .5, width = .3, colour = "black") +
+       theme_minimal() + labs(x="previous talking therapy treatment", y="") + 
+       theme(legend.title = element_blank()) + theme(legend.position = "none") +
+       scale_fill_manual(values=wes_palette(n=2, name="Moonrise3")) +
+       scale_colour_manual(values=wes_palette(n=2, name="Moonrise3")) 
+
+e <- posts_r_ft_demogs %>%
+  dplyr::select(uid, mean_alpha_pos, neurodiv01) %>%
+  mutate(nd = ifelse(neurodiv01==0, "no", "yes")) %>%
+  ggplot(aes(x=nd, y=mean_alpha_pos, group=nd,
+             fill=nd, colour=nd)) +
+       geom_flat_violin(position=position_nudge(x = .1, y = 0),  
+                        adjust = 1.5, trim = TRUE, alpha = .4, colour = NA) +
+       geom_point(position=position_jitter(width=.02), size = 3, shape = 20) +
+       geom_boxplot(outlier.shape = NA, alpha = .5, width = .3, colour = "black") +
+       theme_minimal() + labs(x="self-reported neurodivergence", y="") + 
+       theme(legend.title = element_blank()) + theme(legend.position = "none") +
+       scale_fill_manual(values=wes_palette(n=2, name="Moonrise3")) +
+       scale_colour_manual(values=wes_palette(n=2, name="Moonrise3")) 
+
+f <- posts_r_ft_demogs %>%
+  mutate(precision = 1/sd_alpha_pos) %>%
+  ggplot(aes(x=miniSPIN_total, y=mean_alpha_pos, size = precision, weight = precision)) +
+  geom_point(colour="lightcoral") + 
+  geom_smooth(method = "lm", se=TRUE, alpha=.2, color="grey", formula = y~x) +
+  stat_poly_eq(formula = y~x,
+               aes(label = paste(stat(rr.label), stat(p.value.label), sep = "~~~")),
+               parse = TRUE,
+               label.x = "right", label.y = "top") +
+  theme_minimal() + theme(legend.position="none") 
+
+((b + c) /
+ (a + d) /
+ (f + e))
+```
