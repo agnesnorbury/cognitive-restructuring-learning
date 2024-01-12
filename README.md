@@ -6,7 +6,7 @@ Play a demo version of the causal attribution task (study 1 & 2) [here](https://
 
 Learning training task (study 1 & 2):
 
-<img src="./causal-attr-learning.gif" width="50%" height="50%"/>
+<img src="./causa-attr-learning.gif" width="50%" height="50%"/>
 
 Control learning task (study 2):
 
