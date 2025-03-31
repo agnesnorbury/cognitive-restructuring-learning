@@ -609,7 +609,7 @@ check_hmc_diagnostics(fit)
 params90cis <- summary(fit, pars = c("theta_int_internal_neg", "theta_int_internal_pos",
                                      "theta_int_global_neg", "theta_int_global_pos",
                                      "beta_both_internal", "beta_both_global"), 
-                       probs = c(0.10, 0.90))$summary
+                       probs = c(0.05, 0.95))$summary
 print(params90cis)
 
 # plot using tidybayes
@@ -632,11 +632,11 @@ fit_tidy <- fit %>%
 params90cis <- summary(fit, pars = c("pars_sigma_neg[3]",
                                      "pars_sigma_neg[4]", 
                                      "pars_sigma_pos[3]",
-                                     "pars_sigma_pos[4]"), probs = c(0.1, 0.9))$summary
+                                     "pars_sigma_pos[4]"), probs = c(0.05, 0.95))$summary
 sigma_theta_int_pos_t2 <- params90cis[3,1]
 sigma_theta_glob_pos_t2 <- params90cis[4,1]
 # for betas, which are non hierarchically estimates, we will have to take the SD across posterior mean estimates
-tmp  <- summary(fit, pars = "alpha_pos", probs = c(0.1, 0.9))$summary
+tmp  <- summary(fit, pars = "alpha_pos", probs = c(0.05, 0.95))$summary
 sd_alpha_pos <- sd(tmp[,1])
 
 fit_tidy2 <- fit_tidy %>%
@@ -684,7 +684,7 @@ params90cis <- summary(fit, pars = c("theta_int_internal_neg", "theta_int_intern
                                      "theta_int_global_neg", "theta_int_global_pos",
                                      "beta_both_internal", "beta_both_global",
                                      "beta_activ_internal", "beta_activ_global"), 
-                       probs = c(0.10, 0.90))$summary
+                       probs = c(0.05, 0.95))$summary
 print(params90cis)
 
 # plot using tidybayes
@@ -708,11 +708,11 @@ fit_tidy <- fit %>%
 params90cis <- summary(fit, pars = c("pars_sigma_neg[3]",
                                      "pars_sigma_neg[4]", 
                                      "pars_sigma_pos[3]",
-                                     "pars_sigma_pos[4]"), probs = c(0.1, 0.9))$summary
+                                     "pars_sigma_pos[4]"), probs = c(0.05, 0.95))$summary
 sigma_theta_int_pos_t2 <- params90cis[3,1]
 sigma_theta_glob_pos_t2 <- params90cis[4,1]
 # for betas, which are non hierarchically estimates, we will have to take the SD across posterior mean estimates
-tmp  <- summary(fit, pars = "alpha_pos", probs = c(0.1, 0.9))$summary
+tmp  <- summary(fit, pars = "alpha_pos", probs = c(0.05, 0.95))$summary
 sd_alpha_pos <- sd(tmp[,1])
 
 fit_tidy2 <- fit_tidy %>%

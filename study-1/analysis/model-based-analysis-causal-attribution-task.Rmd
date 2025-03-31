@@ -271,7 +271,7 @@ params90cis <- summary(fit, pars = c("mu_internal_theta_neg[1]", "mu_internal_th
                                      "mu_global_theta_pos[1]",  "mu_global_theta_pos[2]",
                                      "theta_int_internal_neg", "theta_int_internal_pos",
                                      "theta_int_global_neg", "theta_int_global_pos"), 
-                       probs = c(0.1, 0.9))$summary
+                       probs = c(0.05, 0.95))$summary
 print(params90cis)
 
 ## new plotting (standardized / transformed)
@@ -282,7 +282,7 @@ print(params90cis)
 params90cis <- summary(fit, pars = c("pars_sigma_neg[3]",
                                      "pars_sigma_neg[4]", 
                                      "pars_sigma_pos[3]",
-                                     "pars_sigma_pos[4]"), probs = c(0.1, 0.9))$summary
+                                     "pars_sigma_pos[4]"), probs = c(0.05, 0.95))$summary
 sigma_theta_int_neg_t2 <- params90cis[1,1]
 sigma_theta_glob_neg_t2 <- params90cis[2,1]
 sigma_theta_int_pos_t2 <- params90cis[3,1]
